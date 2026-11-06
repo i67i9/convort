@@ -1,0 +1,13 @@
+You need python 3.13 
+_______________________________________________
+open Terminal Or Cmd 
+_______________________________________________
+Paste this code 
+
+pip install customtkinter pillow imageio-ffmpeg
+_______________________________________________
+
+if ypu used Linux you may need Tkinter 
+_______________________________________________
+sudo apt-get install python3-tk
+_______________________________________________
