@@ -1,0 +1,1221 @@
+import os
+import time
+import math
+import base64
+import tempfile
+import random
+import shutil
+import threading
+import subprocess
+import ctypes
+import tkinter as tk
+import customtkinter as ctk
+from tkinter import filedialog
+from PIL import Image
+
+# استيراد winsound للصوت في ويندوز
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
+# إعداد المظهر
+ctk.set_appearance_mode("Dark")
+
+
+# --- تحميل خط Lilita One (الخط مدمج داخل الكود، ما تحتاج ملف جنب السكربت) ---
+FONT_FAMILY = "Arial"
+
+
+def load_custom_font():
+    global FONT_FAMILY
+    if os.name != "nt":
+        return
+    try:
+        data = base64.b64decode("".join(FONT_B64.split()))
+        font_path = os.path.join(tempfile.gettempdir(), "LilitaOne-Regular-embedded.ttf")
+        if not os.path.exists(font_path) or os.path.getsize(font_path) != len(data):
+            with open(font_path, "wb") as f:
+                f.write(data)
+
+        FR_PRIVATE = 0x10
+        added = ctypes.windll.gdi32.AddFontResourceExW(ctypes.c_wchar_p(font_path), FR_PRIVATE, 0)
+        if not added:
+            added = ctk.FontManager.load_font(font_path)
+        if added:
+            FONT_FAMILY = "Lilita One"
+    except Exception as e:
+        print("Font load failed:", e)
+        FONT_FAMILY = "Arial"
+
+
+def get_ffmpeg_path():
+    """البحث عن مسار ffmpeg تلقائياً"""
+    sys_ffmpeg = shutil.which("ffmpeg")
+    if sys_ffmpeg:
+        return sys_ffmpeg
+
+    local_exe = os.path.join(os.getcwd(), "ffmpeg.exe")
+    if os.path.exists(local_exe):
+        return local_exe
+
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def lerp_color(c1, c2, t):
+    """يمزج بين لونين (hex) حسب t من 0 إلى 1 - نستخدمه لتخفيف لون الموجة تدريجياً"""
+    t = max(0.0, min(1.0, t))
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def short_error(text, max_lines=2, max_len=100):
+    """آخر أسطر الخطأ من ffmpeg (السبب الحقيقي دايماً يكون في النهاية)"""
+    lines = [l.strip() for l in str(text).splitlines() if l.strip()]
+    tail = lines[-max_lines:] if lines else ["Unknown error"]
+    return "\n".join(l if len(l) <= max_len else l[:max_len - 3] + "..." for l in tail)
+
+
+def save_error_log(text):
+    """يحفظ الخطأ الكامل في ملف جنب السكربت عشان تقدر تقراه"""
+    try:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "converter_last_error.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(str(text))
+        return log_path
+    except Exception:
+        return None
+
+
+def build_video_attempts(ffmpeg_bin, src, out, fmt):
+    """قائمة محاولات التحويل بالترتيب، كل صيغة لها الكودك المناسب لها"""
+    base = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", src]
+    if fmt == "webm":
+        return [
+            base + ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "32",
+                    "-deadline", "good", "-cpu-used", "4", "-row-mt", "1",
+                    "-c:a", "libopus", out],
+            base + ["-c:v", "libvpx", "-b:v", "5M", "-c:a", "libvorbis", out],
+        ]
+    if fmt == "avi":
+        return [
+            base + ["-c", "copy", out],
+            base + ["-c:v", "mpeg4", "-q:v", "3", "-c:a", "libmp3lame", out],
+        ]
+    return [
+        base + ["-c", "copy", out],
+        base + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", out],
+    ]
+
+
+def run_attempts(attempts, output_path=None):
+    """يجرب المحاولات واحدة واحدة، ولو كلها فشلت يرمي كل الأخطاء"""
+    errors = []
+    flags = 0
+    if os.name == "nt":
+        flags = subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
+    for cmd in attempts:
+        res = subprocess.run(cmd, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace",
+                             stdin=subprocess.DEVNULL, creationflags=flags)
+        if res.returncode == 0:
+            return
+        errors.append(res.stderr)
+    if output_path and os.path.exists(output_path):
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+    raise Exception("\n\n----- next attempt -----\n\n".join(errors) or "ffmpeg failed")
+
+
+def rr_points(x1, y1, x2, y2, r):
+    """نقاط مستطيل بزوايا دائرية"""
+    r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+    return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+
+
+class AnimatedOptionMenu(ctk.CTkOptionMenu):
+    KEY = "#ff00ff"
+    OPEN_TIME = 0.18
+    CLOSE_TIME = 0.12
+
+    _ap_popup = None
+    _ap_canvas = None
+    _ap_job = None
+    _ap_state = "closed"
+    _ap_progress = 0.0
+    _ap_hover = -1
+    _ap_texts = ()
+
+    def __init__(self, master, popup_fg="#FFF5E4", popup_hover="#FFE3C8",
+                 popup_text="#5C1313", popup_font_size=14, popup_radius=12, **kwargs):
+        super().__init__(master, **kwargs)
+        self._ap_fg = popup_fg
+        self._ap_hover_c = popup_hover
+        self._ap_text = popup_text
+        self._ap_font_size = popup_font_size
+        self._ap_radius = popup_radius
+        self._ap_values = []
+        self._ap_last = 0.0
+        self._ap_root_geo = None
+        root = self.winfo_toplevel()
+        root.bind("<Button-1>", self._ap_on_root_click, add="+")
+        root.bind("<Configure>", self._ap_on_root_configure, add="+")
+
+    def _open_dropdown_menu(self):
+        try:
+            if self._ap_state in ("opening", "open"):
+                self._ap_close()
+            else:
+                self._ap_open()
+        except Exception as e:
+            print("Animated dropdown failed, using default menu:", e)
+            self._ap_kill()
+            try:
+                super()._open_dropdown_menu()
+            except Exception:
+                pass
+
+    def configure(self, *args, **kwargs):
+        if "values" in kwargs or kwargs.get("state") == "disabled":
+            self._ap_kill()
+        super().configure(*args, **kwargs)
+
+    def destroy(self):
+        self._ap_kill()
+        super().destroy()
+
+    def _ap_open(self):
+        try:
+            values = list(self.cget("values"))
+        except Exception:
+            values = list(getattr(self, "_values", []))
+        if not values:
+            return
+
+        if self._ap_popup is not None and self._ap_state == "closing":
+            self._ap_state = "opening"
+            self._ap_last = time.perf_counter()
+            self._ap_tick()
+            return
+
+        self._ap_kill()
+
+        scale = max(1.0, self.winfo_fpixels("1i") / 96.0)
+        self._ap_scale = scale
+        self._ap_values = values
+        self._ap_item_h = int(round(30 * scale))
+        self._ap_pad = int(round(6 * scale))
+        self._ap_w = max(self.winfo_width(), 60)
+        self._ap_full_h = len(values) * self._ap_item_h + 2 * self._ap_pad
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height() + int(round(3 * scale))
+
+        top = tk.Toplevel(self)
+        top.withdraw()
+        top.overrideredirect(True)
+        top.transient(self.winfo_toplevel())
+        top.configure(bg=self.KEY)
+        top.attributes("-transparentcolor", self.KEY)
+        top.geometry(f"{self._ap_w}x{self._ap_full_h}+{x}+{y}")
+
+        cv = tk.Canvas(top, width=self._ap_w, height=self._ap_full_h,
+                       bg=self.KEY, highlightthickness=0, bd=0, cursor="hand2")
+        cv.pack()
+
+        self._ap_bg = cv.create_polygon(rr_points(0, 0, self._ap_w, 2, 1), smooth=True,
+                                        fill=self._ap_fg, outline="")
+        self._ap_hl = cv.create_polygon(rr_points(0, 0, 2, 2, 1), smooth=True,
+                                        fill=self._ap_hover_c, outline="", state="hidden")
+        font = (FONT_FAMILY, -int(round(self._ap_font_size * scale)))
+        px = int(round(16 * scale))
+        self._ap_texts = []
+        for i, v in enumerate(values):
+            cy = self._ap_pad + i * self._ap_item_h + self._ap_item_h // 2
+            self._ap_texts.append(cv.create_text(
+                px, cy, text=v, anchor="w", fill=self._ap_fg, font=font, state="hidden"))
+
+        cv.bind("<Motion>", self._ap_on_motion)
+        cv.bind("<Leave>", self._ap_on_leave)
+        cv.bind("<Button-1>", self._ap_on_click)
+
+        self._ap_popup = top
+        self._ap_canvas = cv
+        self._ap_state = "opening"
+        self._ap_progress = 0.0
+        self._ap_hover = -1
+        root = self.winfo_toplevel()
+        self._ap_root_geo = (root.winfo_rootx(), root.winfo_rooty(),
+                             root.winfo_width(), root.winfo_height())
+        self._ap_draw()
+        top.deiconify()
+        top.lift()
+        self._ap_last = time.perf_counter()
+        self._ap_job = self.after(8, self._ap_tick)
+
+    def _ap_close(self):
+        if self._ap_popup is None or self._ap_state in ("closed", "closing"):
+            return
+        self._ap_state = "closing"
+        self._ap_hover = -1
+        self._ap_last = time.perf_counter()
+        self._ap_tick()
+
+    def _ap_kill(self):
+        if self._ap_job is not None:
+            try:
+                self.after_cancel(self._ap_job)
+            except Exception:
+                pass
+            self._ap_job = None
+        if self._ap_popup is not None:
+            try:
+                self._ap_popup.destroy()
+            except Exception:
+                pass
+        self._ap_popup = None
+        self._ap_canvas = None
+        self._ap_state = "closed"
+        self._ap_progress = 0.0
+        self._ap_hover = -1
+        self._ap_texts = ()
+
+    def _ap_tick(self):
+        if self._ap_job is not None:
+            try:
+                self.after_cancel(self._ap_job)
+            except Exception:
+                pass
+            self._ap_job = None
+        if self._ap_popup is None:
+            return
+        now = time.perf_counter()
+        dt = now - self._ap_last
+        self._ap_last = now
+        if self._ap_state == "opening":
+            self._ap_progress = min(1.0, self._ap_progress + dt / self.OPEN_TIME)
+            if self._ap_progress >= 1.0:
+                self._ap_state = "open"
+        elif self._ap_state == "closing":
+            self._ap_progress = max(0.0, self._ap_progress - dt / self.CLOSE_TIME)
+            if self._ap_progress <= 0.0:
+                self._ap_kill()
+                return
+        self._ap_draw()
+        if self._ap_state in ("opening", "closing"):
+            self._ap_job = self.after(8, self._ap_tick)
+
+    def _ap_draw(self):
+        cv = self._ap_canvas
+        if cv is None:
+            return
+        s = self._ap_scale
+        ih = self._ap_item_h
+        w = self._ap_w
+        ease = 1 - (1 - self._ap_progress) ** 3
+        h = max(2.0, self._ap_full_h * ease)
+        cv.coords(self._ap_bg, *rr_points(0, 0, w, h, self._ap_radius * s))
+
+        for i, tid in enumerate(self._ap_texts):
+            zone = self._ap_pad + (i + 0.5) * ih + 0.4 * ih
+            f = (h - zone) / (0.3 * ih)
+            if f <= 0:
+                cv.itemconfigure(tid, state="hidden")
+            else:
+                cv.itemconfigure(tid, state="normal",
+                                 fill=lerp_color(self._ap_fg, self._ap_text, min(1.0, f)))
+
+        if self._ap_state == "open" and 0 <= self._ap_hover < len(self._ap_values):
+            y1 = self._ap_pad + self._ap_hover * ih
+            inset = 5 * s
+            cv.coords(self._ap_hl, *rr_points(inset, y1, w - inset, y1 + ih, 8 * s))
+            cv.itemconfigure(self._ap_hl, state="normal")
+        else:
+            cv.itemconfigure(self._ap_hl, state="hidden")
+
+    def _ap_index_at(self, y):
+        idx = int((y - self._ap_pad) // self._ap_item_h)
+        return idx if 0 <= idx < len(self._ap_values) else -1
+
+    def _ap_on_motion(self, event):
+        if self._ap_state != "open":
+            return
+        idx = self._ap_index_at(event.y)
+        if idx != self._ap_hover:
+            self._ap_hover = idx
+            self._ap_draw()
+
+    def _ap_on_leave(self, event):
+        if self._ap_hover != -1:
+            self._ap_hover = -1
+            if self._ap_state == "open":
+                self._ap_draw()
+
+    def _ap_on_click(self, event):
+        if self._ap_state != "open":
+            return
+        idx = self._ap_index_at(event.y)
+        if idx < 0:
+            return
+        value = self._ap_values[idx]
+        self.set(value)
+        cmd = getattr(self, "_command", None)
+        if callable(cmd):
+            try:
+                cmd(value)
+            except Exception:
+                pass
+        self._ap_close()
+
+    def _ap_on_root_click(self, event):
+        if self._ap_state not in ("opening", "open"):
+            return
+        fx, fy = self.winfo_rootx(), self.winfo_rooty()
+        if fx <= event.x_root <= fx + self.winfo_width() and fy <= event.y_root <= fy + self.winfo_height():
+            return
+        self._ap_close()
+
+    def _ap_on_root_configure(self, event):
+        if self._ap_state == "closed":
+            return
+        root = self.winfo_toplevel()
+        if event.widget is not root:
+            return
+        geo = (root.winfo_rootx(), root.winfo_rooty(), root.winfo_width(), root.winfo_height())
+        if geo != self._ap_root_geo:
+            self._ap_kill()
+
+
+class UniversalConverter(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("File Converter")
+        self.geometry("620x620")
+        self.resizable(False, False)
+
+        # الألوان
+        self.BG_COLOR = "#D33939"
+        self.BTN_CREAM = "#FFF5E4"
+        self.BTN_CREAM_HOVER = "#FFE3C8"
+        self.TEXT_DARK = "#5C1313"
+        self.ACCENT_GREEN = "#A2E025"
+        self.ACCENT_GREEN_HOVER = "#88C01B"
+
+        self.configure(fg_color=self.BG_COLOR)
+
+        self.file_path = ""
+        self.src_ext = ""
+        self.last_mouse_pos = (-1, -1)
+
+        # --- الخلفية الحمراء ---
+        self.effects_canvas = tk.Canvas(self, bg=self.BG_COLOR, highlightthickness=0, bd=0)
+        self.effects_canvas.pack(fill="both", expand=True)
+
+        self.particles = []
+        self.ripples = []
+
+        # --- عناصر الواجهة ---
+        self.title_label = ctk.CTkLabel(
+            self.effects_canvas,
+            text="File Converter",
+            font=(FONT_FAMILY, 32),
+            text_color="#FFFFFF",
+            fg_color="transparent"
+        )
+        self.title_label.pack(pady=(25, 10))
+
+        self.card_frame = ctk.CTkFrame(self.effects_canvas, fg_color="transparent")
+        self.card_frame.pack(pady=10, padx=30, fill="both", expand=True)
+
+        # زر اختيار الملف
+        self.btn_select = ctk.CTkButton(
+            self.card_frame,
+            text="Select File",
+            command=self.select_file,
+            height=45,
+            corner_radius=15,
+            fg_color=self.BTN_CREAM,
+            hover_color=self.BTN_CREAM_HOVER,
+            text_color=self.TEXT_DARK,
+            font=(FONT_FAMILY, 16)
+        )
+        self.btn_select.pack(pady=(20, 10), padx=20)
+
+        # نص المسار
+        self.lbl_file = ctk.CTkLabel(
+            self.card_frame,
+            text="No file selected",
+            text_color="#FFD1D1",
+            font=(FONT_FAMILY, 13),
+            fg_color="transparent"
+        )
+        self.lbl_file.pack(pady=5)
+
+        # قائمة الصيغ
+        self.lbl_format = ctk.CTkLabel(
+            self.card_frame,
+            text="Convert to:",
+            font=(FONT_FAMILY, 16),
+            text_color="#FFFFFF",
+            fg_color="transparent"
+        )
+        self.lbl_format.pack(pady=(15, 5))
+
+        self.format_menu = AnimatedOptionMenu(
+            self.card_frame,
+            values=["-- Select File First --"],
+            fg_color=self.BTN_CREAM,
+            button_color=self.BTN_CREAM_HOVER,
+            button_hover_color=self.BTN_CREAM,
+            text_color=self.TEXT_DARK,
+            dropdown_fg_color=self.BTN_CREAM,
+            dropdown_text_color=self.TEXT_DARK,
+            dropdown_hover_color=self.BTN_CREAM_HOVER,
+            font=(FONT_FAMILY, 14),
+            dropdown_font=(FONT_FAMILY, 14),
+            corner_radius=12,
+            popup_fg=self.BTN_CREAM,
+            popup_hover=self.BTN_CREAM_HOVER,
+            popup_text=self.TEXT_DARK
+        )
+        self.format_menu.pack(pady=5)
+
+        # زر التحويل
+        self.btn_convert = ctk.CTkButton(
+            self.card_frame,
+            text="Convert",
+            command=self.start_conversion_thread,
+            state="disabled",
+            fg_color=self.ACCENT_GREEN,
+            hover_color=self.ACCENT_GREEN_HOVER,
+            text_color=self.TEXT_DARK,
+            font=(FONT_FAMILY, 18),
+            corner_radius=15,
+            height=45
+        )
+        self.btn_convert.pack(pady=(25, 10), padx=20)
+
+        # شريط التقدم
+        self.progress = ctk.CTkProgressBar(self.card_frame, width=380, progress_color=self.ACCENT_GREEN)
+        self.progress.pack(pady=5)
+        self.progress.set(0)
+
+        self.lbl_status = ctk.CTkLabel(self.card_frame, text="", font=(FONT_FAMILY, 13), fg_color="transparent")
+        self.lbl_status.pack(pady=5)
+
+        # كارت التنبيه المدمج بالأسفل
+        self.inline_alert_frame = ctk.CTkFrame(self.card_frame, fg_color="transparent")
+
+        self.lbl_alert_title = ctk.CTkLabel(
+            self.inline_alert_frame, text="", font=(FONT_FAMILY, 16),
+            text_color=self.ACCENT_GREEN, fg_color="transparent"
+        )
+        self.lbl_alert_title.pack(pady=(8, 2))
+
+        self.lbl_alert_msg = ctk.CTkLabel(
+            self.inline_alert_frame, text="", font=(FONT_FAMILY, 12),
+            text_color="#FFFFFF", wraplength=350, fg_color="transparent"
+        )
+        self.lbl_alert_msg.pack(pady=2)
+
+        self.btn_alert_ok = ctk.CTkButton(
+            self.inline_alert_frame,
+            text="OK",
+            width=80,
+            height=28,
+            fg_color=self.ACCENT_GREEN,
+            hover_color=self.ACCENT_GREEN_HOVER,
+            text_color=self.TEXT_DARK,
+            font=(FONT_FAMILY, 13),
+            corner_radius=8,
+            command=self.hide_inline_alert
+        )
+        self.btn_alert_ok.pack(pady=(5, 8))
+
+        # --- نافذة شفافة فوق كل شي للشرار ---
+        self.setup_effects_overlay()
+
+        self.bind_all("<Button-1>", self.spawn_click_ripple)
+        self.animate_effects()
+
+    def setup_effects_overlay(self):
+        self.TRANSPARENT_KEY = "#ff00ff"
+        self.overlay = tk.Toplevel(self)
+        self.overlay.overrideredirect(True)
+        self.overlay.transient(self)
+        self.overlay.configure(bg=self.TRANSPARENT_KEY)
+        self.overlay.attributes("-transparentcolor", self.TRANSPARENT_KEY)
+
+        self.fx_canvas = tk.Canvas(
+            self.overlay, bg=self.TRANSPARENT_KEY, highlightthickness=0, bd=0
+        )
+        self.fx_canvas.pack(fill="both", expand=True)
+
+        self.overlay_geometry = ""
+        self.overlay_visible = True
+        self.click_through_ok = False
+        self.last_spawn = 0.0
+        self.after(200, self.make_overlay_click_through)
+
+    def make_overlay_click_through(self):
+        try:
+            self.overlay.update_idletasks()
+            user32 = ctypes.windll.user32
+            wid = self.overlay.winfo_id()
+            hwnd = user32.GetParent(wid) or wid
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_NOACTIVATE = 0x08000000
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(
+                hwnd, GWL_EXSTYLE,
+                style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
+            )
+            self.click_through_ok = True
+        except Exception:
+            self.click_through_ok = False
+
+    def sync_overlay(self):
+        if self.state() in ("iconic", "withdrawn"):
+            if self.overlay_visible:
+                self.overlay.withdraw()
+                self.overlay_visible = False
+            return
+
+        if not self.overlay_visible:
+            self.overlay.deiconify()
+            self.overlay_visible = True
+            self.overlay_geometry = ""
+
+        geo = (
+            f"{self.winfo_width()}x{self.winfo_height()}"
+            f"+{self.winfo_rootx()}+{self.winfo_rooty()}"
+        )
+        if geo != self.overlay_geometry:
+            self.overlay.geometry(geo)
+            self.overlay.lift()
+            self.overlay_geometry = geo
+
+    def spawn_spark_particle(self, x, y, speed_min=1.0, speed_max=2.5, size_max=3):
+        angle = random.uniform(0, 2 * math.pi)
+        speed = random.uniform(speed_min, speed_max)
+        dx = math.cos(angle) * speed
+        dy = math.sin(angle) * speed
+        size = random.randint(1, size_max)
+
+        if not self.click_through_ok:
+            x += math.cos(angle) * 10
+            y += math.sin(angle) * 10
+
+        p_id = self.fx_canvas.create_oval(
+            x - size, y - size,
+            x + size, y + size,
+            fill="#111111", outline=""
+        )
+        self.particles.append({
+            "id": p_id, "x": x, "y": y,
+            "dx": dx, "dy": dy,
+            "born": time.perf_counter(),
+            "life": random.randint(6, 10) * 0.03
+        })
+
+    def spawn_click_ripple(self, event):
+        x = event.x_root - self.winfo_rootx()
+        y = event.y_root - self.winfo_rooty()
+        self.add_ring(x, y, max_r=26, dur=0.45, w0=2)
+
+    def add_ring(self, x, y, max_r, dur, w0):
+        try:
+            r_id = self.fx_canvas.create_oval(
+                x - 2, y - 2, x + 2, y + 2,
+                outline="#111111", width=w0
+            )
+        except tk.TclError:
+            return
+        self.ripples.append({
+            "id": r_id, "x": x, "y": y,
+            "born": time.perf_counter(),
+            "dur": dur, "max_r": max_r, "w0": w0
+        })
+
+    def animate_effects(self):
+        t0 = time.perf_counter()
+        try:
+            self.sync_overlay()
+        except Exception:
+            pass
+
+        try:
+            rel_x = self.winfo_pointerx() - self.winfo_rootx()
+            rel_y = self.winfo_pointery() - self.winfo_rooty()
+            inside = 0 <= rel_x <= self.winfo_width() and 0 <= rel_y <= self.winfo_height()
+
+            if inside and self.overlay_visible and (t0 - self.last_spawn) >= 0.03:
+                self.last_spawn = t0
+                curr_pos = (rel_x, rel_y)
+                if curr_pos != self.last_mouse_pos:
+                    for _ in range(2):
+                        self.spawn_spark_particle(rel_x, rel_y, speed_min=1.2, speed_max=2.8, size_max=3)
+                    self.last_mouse_pos = curr_pos
+                else:
+                    if random.random() < 0.35:
+                        self.spawn_spark_particle(rel_x, rel_y, speed_min=0.3, speed_max=1.0, size_max=2)
+        except Exception:
+            pass
+
+        now = time.perf_counter()
+
+        new_particles = []
+        for p in self.particles:
+            age = now - p["born"]
+            if age < p["life"]:
+                steps = age / 0.03
+                px = p["x"] + p["dx"] * steps
+                py = p["y"] + p["dy"] * steps
+                self.fx_canvas.coords(p["id"], px - 2, py - 2, px + 2, py + 2)
+                new_particles.append(p)
+            else:
+                self.fx_canvas.delete(p["id"])
+        self.particles = new_particles
+
+        new_ripples = []
+        for r in self.ripples:
+            t = (now - r["born"]) / r["dur"]
+            if t < 1.0:
+                ease = 1 - (1 - t) ** 3
+                radius = 3 + (r["max_r"] - 3) * ease
+                color = lerp_color("#111111", self.BG_COLOR, t)
+                self.fx_canvas.coords(
+                    r["id"],
+                    r["x"] - radius, r["y"] - radius,
+                    r["x"] + radius, r["y"] + radius
+                )
+                self.fx_canvas.itemconfigure(r["id"], outline=color)
+                new_ripples.append(r)
+            else:
+                self.fx_canvas.delete(r["id"])
+        self.ripples = new_ripples
+
+        try:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            self.after(max(1, int(16 - elapsed_ms)), self.animate_effects)
+        except tk.TclError:
+            pass
+
+    # --- منطق التحويل والعمليات ---
+    def select_file(self):
+        filetypes = [
+            ("All Supported Files", "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.ico *.mp4 *.mov *.avi *.mkv *.mp3 *.wav *.flac *.aac *.m4a"),
+            ("Image Files", "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.ico"),
+            ("Video Files", "*.mp4 *.mov *.avi *.mkv *.webm"),
+            ("Audio Files", "*.mp3 *.wav *.flac *.aac *.m4a")
+        ]
+        path = filedialog.askopenfilename(filetypes=filetypes)
+        if path:
+            self.file_path = path
+            self.src_ext = os.path.splitext(path)[1].lower()
+            self.lbl_file.configure(text=f"Selected: {os.path.basename(path)}", text_color="#FFFFFF")
+            self.btn_select.configure(text="Change File")
+            self.update_format_options(self.src_ext)
+            self.btn_convert.configure(state="normal")
+            self.progress.set(0)
+            self.lbl_status.configure(text="")
+            self.hide_inline_alert()
+
+    def update_format_options(self, ext):
+        image_exts = ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.ico']
+        video_exts = ['.mp4', '.mov', '.avi', '.mkv', '.webm']
+        audio_exts = ['.mp3', '.wav', '.flac', '.aac', '.m4a']
+
+        options = []
+        if ext in image_exts:
+            targets = [e.strip('.').upper() for e in image_exts if e != ext]
+            options = [f"to {t}" for t in targets]
+        elif ext in video_exts:
+            video_targets = [e.strip('.').upper() for e in video_exts if e != ext]
+            audio_targets = [e.strip('.').upper() for e in audio_exts]
+            options = [f"to {t}" for t in video_targets + audio_targets]
+        elif ext in audio_exts:
+            targets = [e.strip('.').upper() for e in audio_exts if e != ext]
+            options = [f"to {t}" for t in targets]
+        else:
+            options = ["Not Supported"]
+
+        self.format_menu.configure(values=options)
+        self.format_menu.set(options[0])
+
+    def start_conversion_thread(self):
+        threading.Thread(target=self.convert_file, daemon=True).start()
+
+    def convert_file(self):
+        selected_option = self.format_menu.get()
+        if not self.file_path or selected_option == "Not Supported":
+            return
+
+        target_fmt = selected_option.replace("to ", "").strip().lower()
+        base_name, src_ext = os.path.splitext(self.file_path)
+        output_path = f"{base_name}_converted.{target_fmt}"
+
+        image_exts = ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.ico']
+        audio_exts = ['mp3', 'wav', 'flac', 'aac', 'm4a']
+
+        self.after(0, lambda: self.set_ui_state("disabled"))
+
+        try:
+            if src_ext.lower() in image_exts:
+                with Image.open(self.file_path) as img:
+                    if target_fmt in ['jpg', 'jpeg'] and img.mode in ('RGBA', 'LA'):
+                        img = img.convert('RGB')
+                    
+                    # حفظ بصيغة ICO مع تضمين الأحجام القياسية للأيقونة
+                    if target_fmt == 'ico':
+                        icon_sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+                        img.save(output_path, format='ICO', sizes=icon_sizes)
+                    else:
+                        img.save(output_path)
+
+            else:
+                ffmpeg_bin = get_ffmpeg_path()
+                if not ffmpeg_bin:
+                    raise Exception("FFmpeg missing! Please run 'pip install imageio-ffmpeg'")
+
+                if target_fmt in audio_exts:
+                    attempts = [[ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", self.file_path, "-vn", output_path]]
+                else:
+                    attempts = build_video_attempts(ffmpeg_bin, self.file_path, output_path, target_fmt)
+                run_attempts(attempts, output_path)
+
+            self.after(0, lambda: self.on_conversion_success(output_path))
+
+        except Exception as e:
+            err_text = str(e)
+            log_path = save_error_log(err_text)
+            msg = short_error(err_text)
+            if log_path:
+                msg += "\n(full log: converter_last_error.log)"
+            self.after(0, lambda m=msg: self.on_conversion_error(m))
+
+        finally:
+            self.after(0, lambda: self.set_ui_state("normal"))
+
+    def set_ui_state(self, state):
+        self.btn_select.configure(state=state)
+        self.format_menu.configure(state=state)
+        self.btn_convert.configure(state=state)
+        if state == "disabled":
+            self.hide_inline_alert()
+            self.progress.set(0.3)
+            self.lbl_status.configure(text="Converting...", text_color="#FFFFFF")
+
+    def on_conversion_success(self, output_path):
+        self.progress.set(1.0)
+        self.lbl_status.configure(text="Completed!", text_color=self.ACCENT_GREEN)
+        self.show_inline_alert("Success", f"File saved:\n{output_path}", is_success=True)
+
+    def on_conversion_error(self, err_msg):
+        self.progress.set(0)
+        self.lbl_status.configure(text="Error occurred", text_color="#FF8888")
+        self.show_inline_alert("Error", err_msg, is_success=False)
+
+    def show_inline_alert(self, title, message, is_success=True):
+        accent = self.ACCENT_GREEN if is_success else "#FF6B6B"
+        self.lbl_alert_title.configure(text=f"✔ {title}" if is_success else f"✖ {title}", text_color=accent)
+        self.lbl_alert_msg.configure(text=message)
+        self.btn_alert_ok.configure(fg_color=accent)
+
+        self.inline_alert_frame.pack(pady=(10, 5), padx=20, fill="x")
+        threading.Thread(target=self.play_chime, daemon=True).start()
+
+    def hide_inline_alert(self):
+        self.inline_alert_frame.pack_forget()
+
+    def play_chime(self):
+        if winsound:
+            try:
+                winsound.Beep(523, 80)
+                winsound.Beep(659, 80)
+                winsound.Beep(784, 120)
+            except Exception:
+                pass
+
+
+# خط Lilita One مدمج (Base64) - لا تعدّل عليه
+FONT_B64 = """
+AAEAAAAPAIAAAwBwR0RFRgARAOQAAAEMAAAAFkdQT1PuoviQAAAG2AAAAlJHU1VCbIp0hQAAASQAAAAYT1MvMmZPF60AAAG4AAAA
+YGNtYXDWK7K3AAACGAAAAPRnYXNwAAAAEAAAAQQAAAAIZ2x5ZqBMls0AABCQAABYOmhlYWT4vFe7AAABgAAAADZoaGVhBuEDxgAA
+AVwAAAAkaG10eNxXIQAAAAksAAADkGxvY2FM+TcLAAADDAAAAcptYXhwASwAUAAAATwAAAAgbmFtZV5Cf1UAAAy8AAAD0nBvc3T7
+hBjeAAAE2AAAAf9wcmVwaAaMhQAAAPwAAAAHuAH/hbAEjQAAAQAB//8ADwABAAAADAAAAAAAAAACAAEAAQDjAAEAAAABAAAACgAW
+ABYAAWxhdG4ACAAAAAAAAAABAAAA5ABNAAYAAAAAAAIAAAABAAEAAABAAAAAAAAAAAEAAAOb/yQAAAPu/4r/zwO5AAEAAAAAAAAA
+AAAAAAAAAADkAAEAAAABAIOv/fF2Xw889QALA+gAAAAAyy0JygAAAADLLQnK/4r/JAO5A5sAAAAIAAIAAAAAAAAAAgGnAZAABQAA
+ArwCigAAAIwCvAKKAAAB3QAyAPoAAAIAAAAAAAAAAACAAAAvQAAASgAAAAAAAAAAUFlSUwBAACD7AgOa/yUAAAObANwAAAABAAAA
+AAH6AsAAAAAgAAIAAAACAAAAAwAAABQAAwABAAAAFAAEAOAAAAA0ACAABAAUAH4ArgD/ATEBQgFTAWEBeAF+AZICxwLaAtwgFCAa
+IB4gIiAmIDAgOiBEIKwhIiIS+wL//wAAACAAoQCwATEBQQFSAWABeAF9AZICxgLaAtwgEyAYIBwgICAmIDAgOSBEIKwhIiIS+wH/
+///j/8H/wP+P/4D/cf9l/0//S/84/gX98/3y4LzgueC44LfgtOCr4KPgmuAz377ezwXhAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbAE4AvQERAVwBogG/AeICBAJDAngCkQKuAr4C4AL/AxkD
+SQODA68D4QQVBDUEbASZBLIE1QT4BSwFTwWIBdsGAgY1BmMGiAavBtAHBAcnB10Hhwe4B9UICwgsCEsIcwihCM4JDAkvCVEJdAmr
+CdsKAgoxClYKegqfCsIK3wr4CzELVguAC7YL4wwNDD0MYwx8DKEMxQzYDQ4NPA1TDYcNrQ3YDgsOLQ5XDnMOnw7MDuoPDg9HD2UP
+ng/MD+cQHhBpELkRAhE2EYQRnhHfEhYSUhJwEo0SzRLqEzATWROPE6oT3BQWFCYUQxRYFHQUsRT+FU8VvBX2Fi8WaharFvoXNBdx
+F6cX6hgkGGAYoRjbGSMZbhm+GggaRBqOGsEa9hswG3gbrBvhHCccXBySHM4dAx0+HWodqh31HkMelh72H0Mfkh/iICQgZSCnIO8h
+MCFUIXohpSHJIg0iYyKNIrki6iMqI1YjhiPLJAkkSCSMJMok/SUqJVwlbCWnJdMmDCZKJqMm8ScsJ3YntSf1KBYoNyhUKIIonyi8
+KNgo9CkNKT4pbimaKdAqHCotKlEqsyrUKvUrFytdK5YrsyvsLB0AAAACAAAAAAAA/7UAMgAAAAAAAAAAAAAAAAAAAAAAAAAAAOQA
+AAABAAIAAwAEAAUABgAHAQIACQAKAAsADAANAA4ADwAQABEAEgATABQAFQAWABcAGAAZABoAGwAcAB0AHgAfACAAIQAiACMAJAAl
+ACYAJwAoACkAKgArACwALQAuAC8AMAAxADIAMwA0ADUANgA3ADgAOQA6ADsAPAA9AD4APwBAAEEAQgBDAEQARQBGAEcASABJAEoA
+SwBMAE0ATgBPAFAAUQBSAFMAVABVAFYAVwBYAFkAWgBbAFwAXQBeAF8AYABhAKMAhACFAL0AlgDoAIYAjgCLAJ0AqQCkAQMAigCD
+AJMA8gDzAI0AlwCIAMMA3gDxAJ4AqgD1APQA9gCiAK0AyQDHAK4AYgBjAJAAZADLAGUAyADKAM8AzADNAM4A6QBmANMA0ADRAK8A
+ZwDwAJEA1gDUANUAaADrAO0AiQBqAGkAawBtAGwAbgCgAG8AcQBwAHIAcwB1AHQAdgB3AOoAeAB6AHkAewB9AHwAuAChAH8AfgCA
+AIEA7ADuALoA1wDiAOMAsACxAOQA5QC7AOYA5wCmANgA4QDdANkAsgCzALYAtwDEALQAtQDFAIIAwgCHAKsAxgC+AL8AvAEEAIwA
+7wDAAMEHdW5pMDAyNQd1bmkwMEFEBEV1cm8AAAEAAAAKAB4ALAABbGF0bgAIAAQAAAAA//8AAQAAAAFrZXJuAAgAAAABAAAAAQAE
+AAIAAAABAAgAAQAmAAQAAAAOAgABygHAAbIBrAF6AXQBMgEIAPIAqAByAEwARgABAA4AJAApAC4ALwAwADMANAA3ADkAOgA8AEkA
+TgBcAAEARv/xAAkARP/xAEb/8QBI/+cAUv/nAFT/5wBW/+wAV//nAFn/7ABc/90ADQBE/+IARv/nAEf/8QBI/+cASv/sAFL/5wBU
+/+wAVv/sAFf/4gBY/+cAWf/sAFr/7ABb//EAEgAk/84ALf/YADD/7AA0/+wARP/iAEb/2ABH/9gASP/YAEr/2ABQ/90AUf/dAFL/
+2ABU/9gAVf/iAFb/2ABb/+IAXP/dAF3/8QAFACT/3QAt/+wAMv/sAET/7ABI/+cACgAk/9gALf/sAET/3QBG/90AR//dAEj/3QBK
+/90AUv/dAFT/3QBc/+cAEAAk/+cALf/dAET/5wBG/90ASP/dAEr/5wBQ/+wAUf/sAFL/3QBU/90AVf/xAFb/5wBY/90AWf/iAFr/
+4gBc/+wAAQA8/+IADAAk/8QALf/TADn/3QA8/90APf/xAET/5wBG/+wASP/sAEr/5wBS/+cAVP/nAFb/5wABADz/7AADADf/3QA5
+/+wAPP/dAAIAWf/xAFz/8QANACT/0wBE/90ASP/dAFD/7ABR/+wAUv/dAFT/4gBV/+cAVv/nAFj/5wBb/90AXP/dAF3/4gAGADf/
+5wA5/9gAOv/dADz/2ABZ//EAXP/xAAAAxwAAAAAAAAFNAAAAvAAAAR8ALQHMAEEDQQBaAhMAIgMeACMCmwAsAS0ARgGuAF8BpgBf
+Ai0AUQJaACUBMQA1Ag0AIwDlABQCPQAAAn8AIwGWAA8CDQArAhAAFAJWAAkCDAArAj8AIwH0ABgCOgAbAjUAKAEVADoBFQANAeQA
+NAJEAEMBwgAzAkgAQgNjACcCjwAPAlIAPQIxAB4CaAAyAe0AMgHYAC0CbQAeAoQAMgGtABEBzgAJAmwAMgGzACgDiwAyAogAMgK4
+AB4COgAuAsIAHgJOADICEwAdAfYABQJ0AB4ClQALA7kAFQKrABICZ//1AjMAJQGBAFACSwARAYEAHgKvACwCfAAvAV4ARwIFAA4C
+CAAyAagAGgI1ABoB5gAaAXcAFAIEABoB9QAtAREALQEP/4oCEwAtARAALQMUABMCJwAUAgEAGgIrABMB/wAaAYwAFAHCABkBcAAT
+AiAAKAIJAAYC8AALAi0ADwIZAAoBxgAZAWoAHgJ0AP0BagBQAcsAFQEfAC0CEAAjAeoAHQLYAFcCkwAAAZ8AmQJpACgByQAmArUA
+VAH6AFADBQBZAmUAQwHGAC8CvQBUAYIAKAJTAEMBYAA3ATEAHQFlAEcCPAAoAwwAHgE1ADoBkgBkARsAKQFuACgC3ABZA0cAUQNQ
+AFMDZABFAkgAQQKPAA4CjwAOAo8ADgKPAA4CjwAOAo8ADgOVACICIgAPAegALQHoAC0B6AAtAegALQGwABIBsAASAbAAEgGwABIC
+bP/zApEAKwK4AB4CuAAeArgAHgK4AB4CuAAeAmIAZQK4AB4CdAAeAnQAHgJ0AB4CdAAeAmf/9QJTAC4CoABSAgUADgIFAA4CBQAO
+AgUADgIFAA4CBQAOAq0ADgGoABoB5gAaAeYAGgHmABoB5gAaAQsAFgELABUBC//ZAQv/ywI+ACgCJwAUAgEAGgIBABoCAQAaAgEA
+GgIBABoCYwAmAgEAGgIgACgCIAAoAiAAKAIgACgCGQAKAnQAXAIMAAoA+QAmAdUABQF9AAUDbQAeAwYAGgIYAB0BwgAZAmf/9QIz
+ACUBxgAZAab/pgHgAEgB4wBIAYwAcAG4ABUB1QAvAxUAQwFVAFkBOgBGAXAANQI0AFkCEgBGAosANQHbACUB4AAlAWUAUwONADoD
+7gAjAfEAWQG7AFkBOf+rAj4ANgMjADUCWwBDAogAFAKHABQAAAANAKIAAwABBAkAAAC8AnQAAwABBAkAAQAUAmAAAwABBAkAAgAO
+AlIAAwABBAkAAwBAAhIAAwABBAkABAAUAmAAAwABBAkABQAaAfgAAwABBAkABgASAeYAAwABBAkABwBSAZQAAwABBAkACAAeAXYA
+AwABBAkACQAeAXYAAwABBAkADAAiAVQAAwABBAkADQEgADQAAwABBAkADgA0AAAAaAB0AHQAcAA6AC8ALwBzAGMAcgBpAHAAdABz
+AC4AcwBpAGwALgBvAHIAZwAvAE8ARgBMAFQAaABpAHMAIABGAG8AbgB0ACAAUwBvAGYAdAB3AGEAcgBlACAAaQBzACAAbABpAGMA
+ZQBuAHMAZQBkACAAdQBuAGQAZQBuACAAdABoAGUAIABTAEkATAAgAE8AcABlAG4AIABGAG8AbgB0ACAATABpAGMAZQBuAHMAZQAs
+ACAAVgBlAHIAcwBpAG8AbgAgADEALgAxAC4AIABUAGgAaQBzACAAbABpAGMAZQBuAHMAZQAgAGkAcwAgAGEAdgBhAGkAbABhAGIA
+bABlACAAdwBpAHQAaAAgAGEAIABGAEEAUQAgAGEAdAA6ACAAaAB0AHQAcAA6AC8ALwBzAGMAcgBpAHAAdABzAC4AcwBpAGwALgBv
+AHIAZwAvAE8ARgBMAHcAdwB3AC4AcgBlAG0AbwBsAGEAYwBoAGEALgBiAGkAegBKAHUAYQBuACAATQBvAG4AdABvAHIAZQBhAG4A
+bwBMAGkAbABpAHQAYQAgAGkAcwAgAGEAIAB0AHIAYQBkAGUAbQBhAHIAawAgAG8AZgAgAEoAdQBhAG4AIABNAG8AbgB0AG8AcgBl
+AGEAbgBvAC4ATABpAGwAaQB0AGEATwBuAGUAVgBlAHIAcwBpAG8AbgAgADEALgAwADAAMgBKAHUAYQBuAE0AbwBuAHQAbwByAGUA
+YQBuAG8AOgAgAEwAaQBsAGkAdABhACAATwBuAGUAOgAgADIAMAAxADEAUgBlAGcAdQBsAGEAcgBMAGkAbABpAHQAYQAgAE8AbgBl
+AEMAbwBwAHkAcgBpAGcAaAB0ACAAKABjACkAIAAyADAAMQAxACAASgB1AGEAbgAgAE0AbwBuAHQAbwByAGUAYQBuAG8AIAAoAGoA
+dQBhAG4AQAByAGUAbQBvAGwAYQBjAGgAYQAuAGIAaQB6ACkALAAgAHcAaQB0AGgAIABSAGUAcwBlAHIAdgBlAGQAIABGAG8AbgB0
+ACAATgBhAG0AZQBzACAAIgBMAGkAbABpAHQAYQAgAE8AbgBlACIAAAACAC3//ADmAscABwAPAAA3FCI1AzQyFQM0Mh0BFCI10o8U
+t7m5udIGBQHtCAf91wcGkAoGAAACAEEBpgGOArUADwAfAAATFRQHBiInJjUnNDc2MhcWEiInJj0BNDc2MhcWFQcUB9AcDhwOHR4j
+EiQSJHYcDh0jEiQSJB4cApfTEggEBAgS0xIIBAQI/v0ECBLTEggEBAgS0xIIAAACAFr//gMEAqsARwBLAAABMhcWFAcGIw8BBiMi
+JyY/ASMHBiMiJyY/ASMiJyY0PgEXMzcjIicmND4BFzM3NjMyFxYPATM3NhcWFxYPATMyFxYUBwYrAQcnBzM3AsASCAUDBxOWOQYY
+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
+SrGzARuusrxBPmU/QQLZFBwmBloYIx8LBUz9HbgBYbaz/pWxAg9Yn1VWoFYAAwAe//YCmgONABIAGgAiAAATIicmND8BNjIfARYV
+FAYjIicGAiYQNiAWEAYCBhQWMjY0Jt0JDxQGmgcIB5oGIgkCfn0QsbMBG66yvEE+ZT9BAtQWHigFVAQEVAUJHzRKSv0iuAFhtrP+
+lbECD1ifVVagVgADAB7/9gKaA4gAHgAmAC4AABMuATQ3NjMyFjM2NzYzMhYVFAcGIyIjIiYiDgQCJhA2IBYQBgIGFBYyNjQmzRMh
+Az9DH04VJSACAwwqMB8dBAMmXBUOCw8IFAOxswEbrrK8QT5lP0EC8QU6EgM/JQEmATgKHSAWKAQDCgUQ/QK4AWG2s/6VsQIPWJ9V
+VqBWAAAEAB7/9gKaA4UABwAPABcAHwAAARQiPQE0MhUXFCI9ATQyFQAmEDYgFhAGAgYUFjI2NCYBLouL5ouL/ruxswEbrrK8QT5l
+P0EC8AYFjAkFjwYFjAkF/He4AWG2s/6VsQIPWJ9VVqBWAAEAZQCQAfkCJQAgAAATJjQ+ATIfATc2Mh4BFA8BFxYUBgcGIyIvAQcG
+IiY0PwFsBhYoFAZwcgYTKBcGcnEGCxAbEwkGcW8HHDYHbwHLBhMnGAZxcgYXKBMGcnEGDxoPGgZxbwc2HAdvAAADAB7/rwKaAxYA
+HAAjACsAADcmEDYzMhc3NjMyFxYUDwEWEAYjIicHBiMiLgE3JDY0JwMWMycUFxMmIyIGgWOziTU1KwoLJh4RAixvspE6OSgHDhMu
+GAYBSVAXqxcakQ+kFA49VEdhAWe2DlMLGg4SBVVf/oWxE04MFR8Nmm6xM/63CdM/KwE8BXAAAAIAHv/2AlIDjwAUACIAAAE0MhUR
+FAYgJjURNDIVERQXFjI2NQMmNTQ2MzIXFhUUBiMiAXnZkv7/odkVFjAnqAUmCgOjBiAJAgKzFBT+KmaBhXEBxBQU/kcUCw0WFgIu
+BQkhO1oGCB4wAAACAB7/9gJSA48ADgAjAAATIicmNDc2MzIXFhUUBwYXNDIVERQGICY1ETQyFREUFxYyNjX1CQ4SBqMDCg8XBayC
+2ZL+/6HZFRYwJwLZFBwmBloYIx8LBUwmFBT+KmaBhXEBxBQU/kcUCw0WFgACAB7/9gJSA40AEgAnAAATIicmND8BNjIfARYVFAYj
+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
+"""
+
+
+if __name__ == "__main__":
+    load_custom_font()
+    app = UniversalConverter()
+    try:
+        from tkinter import font as tkfont
+        print("Lilita One registered:", "Lilita One" in tkfont.families(app))
+    except Exception:
+        pass
+    app.mainloop()
